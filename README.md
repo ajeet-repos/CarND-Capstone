@@ -12,6 +12,9 @@ This is the project repo for the final project of the Udacity Self-Driving Car N
  | Team Member 3 | Wenke Xu     | hanmoyuan000@126.com         |
  | Team Member 4 | Avnit Mackin | avnit.mackin@mail.huji.ac.il |
 
+## Acknowledgement
+
+Thank you to all the team members for helping me throughout the project. Specially Chiheng Liao without whoes help I wouldn't be able to finish this project. 
 
 ### Native Installation
 
