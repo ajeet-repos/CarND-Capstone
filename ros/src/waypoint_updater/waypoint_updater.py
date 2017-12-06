@@ -1,13 +1,12 @@
 #!/usr/bin/env python
 
 import rospy
-from geometry_msgs.msg import PoseStamped
-from styx_msgs.msg import Lane, Waypoint
-
 from std_msgs.msg import Int32
+from geometry_msgs.msg import PoseStamped, TwistStamped
+from styx_msgs.msg import Lane, Waypoint, TrafficLight, TrafficLightArray
 
-import math, sys
-from itertools import islice, cycle
+import math
+import copy
 
 '''
 This node will publish waypoints from the car's current position to some `x` distance ahead.
@@ -33,6 +32,7 @@ class WaypointUpdater(object):
 
         rospy.Subscriber('/current_pose', PoseStamped, self.pose_cb)
         rospy.Subscriber('/base_waypoints', Lane, self.waypoints_cb)
+        rospy.Subscriber( '/current_velocity', TwistStamped, self.velocity_cb )
 
         # TODO: Add a subscriber for /traffic_waypoint and /obstacle_waypoint below
         rospy.Subscriber('/traffic_waypoint', Int32, self.traffic_cb)
@@ -42,26 +42,88 @@ class WaypointUpdater(object):
         self.final_waypoints_pub = rospy.Publisher('final_waypoints', Lane, queue_size=1)
 
         # TODO: Add other member variables you need below
-        self.waypoints = None
-        self.current_pose = None
+        self.base_wps = None
+        self.traffic_wp = -1
+        self.velocity = 0
+
+        v = rospy.get_param('/waypoint_loader/velocity', 40. )
+        self.vel_max = ( v * 1000. ) / ( 60. * 60. )
 
         rospy.spin()
 
     def pose_cb(self, msg):
         # TODO: Implement
-        self.current_pose = msg.pose
-        rospy.loginfo("Car position updated to %s", self.current_pose)
-        self.send_next_waypoints()
+        # pos = msg.pose.position
+        # ort = msg.pose.orientation
+        # rospy.loginfo( "[waypoint_updater.pose_cb] position = (%f, %f, %f)", \
+        #     pos.x, pos.y, pos.z )
+        # rospy.loginfo( "[waypoint_updater.pose_cb] orientation = (%f, %f, %f, %f)", \
+            # ort.x, ort.y, ort.z, ort.w )
+        if self.base_wps == None:
+            rospy.loginfo( "[waypoint_updater.pose_cb] No base_waypoints." )
+            return
 
-    def waypoints_cb(self, waypoints):
+        cpos = msg.pose.position
+        cort = msg.pose.orientation
+
+        near_i = self.get_closest_waypoint( cpos ) + 1
+        num_wps = len( self.base_wps.waypoints )
+
+        lane = Lane()
+        lane.header.frame_id = '/world'
+        lane.header.stamp = rospy.Time(0)
+
+        # self.traffic_wp = -1
+        if self.traffic_wp == -1:
+            if near_i + LOOKAHEAD_WPS > num_wps:
+                lane.waypoints = self.base_wps.waypoints[ near_i : ] + \
+                            self.base_wps.waypoints[ : near_i + LOOKAHEAD_WPS - num_wps ]
+            else:
+                lane.waypoints = self.base_wps.waypoints[ near_i : near_i + LOOKAHEAD_WPS ]
+        elif self.traffic_wp >= near_i:
+            lane.waypoints = self.base_wps.waypoints[ near_i : self.traffic_wp + 1 ]
+        elif near_i - self.traffic_wp <= 10:
+            lane.waypoints = self.base_wps.waypoints[ near_i : near_i + 1 ]
+        else:
+            lane.waypoints = self.base_wps.waypoints[ near_i : ] + \
+                                self.base_wps.waypoints[ : self.traffic_wp + 1 ]
+
+        # Set velocities
+        if self.traffic_wp == -1:
+            self.accelerate( lane.waypoints, near_i )
+        else:
+            self.decelerate( lane.waypoints, near_i )
+
+        # rospy.loginfo( "[waypoint_updater ===>] car = %d, red = %d", near_i, self.traffic_wp )
+        self.final_waypoints_pub.publish( lane )
+
+    def velocity_cb( self, msg ):
+        self.velocity = msg.twist.linear.x
+
+    def get_closest_waypoint( self, pos ):
+        if self.base_wps == None:
+            return None
+
+        dist = float( "inf" )
+        wpi = None
+        for i, wp in enumerate( self.base_wps.waypoints ):
+            p = wp.pose.pose.position
+            d = math.sqrt( ( p.x - pos.x ) ** 2 + ( p.y - pos.y ) ** 2 + ( p.z - pos.z ) ** 2 )
+            if d < dist:
+                wpi = i
+                dist = d
+
+        return wpi
+
+    def waypoints_cb(self, lane):
         # TODO: Implement
-        if self.waypoints is None:
-            self.waypoints = waypoints.waypoints
-            self.send_next_waypoints()
+        self.base_wps = lane
 
     def traffic_cb(self, msg):
         # TODO: Callback for /traffic_waypoint message. Implement
-        pass
+        if self.traffic_wp != msg.data:
+            rospy.loginfo( "[waypoint_updater.traffic_cb] traffic_wp = %d", msg.data )
+        self.traffic_wp = msg.data
 
     def obstacle_cb(self, msg):
         # TODO: Callback for /obstacle_waypoint message. We will implement it later
@@ -73,7 +135,7 @@ class WaypointUpdater(object):
     def set_waypoint_velocity(self, waypoints, waypoint, velocity):
         waypoints[waypoint].twist.twist.linear.x = velocity
 
-    def distance(self, waypoints, wp1, wp2):
+    def _distance(self, waypoints, wp1, wp2):
         dist = 0
         dl = lambda a, b: math.sqrt((a.x-b.x)**2 + (a.y-b.y)**2  + (a.z-b.z)**2)
         for i in range(wp1, wp2+1):
@@ -81,45 +143,53 @@ class WaypointUpdater(object):
             wp1 = i
         return dist
 
-    def send_next_waypoints(self):
-        if self.waypoints is None or self.current_pose is None:
-            return
+    def distance(self, waypoints, wp1, wp2):
+        num = len( waypoints )
+        wp1, wp2 = wp1 % num, wp2 % num
+        if wp2 > wp1:
+            return self._distance( waypoints, wp1, wp2 )
+        else:
+            num_wps = len( self.base_wps.waypoints )
+            return self._distance( waypoints, wp1, num_wps - 1 ) + \
+                    self._distance( waypoints, 0, wp2 )
 
-        carx = self.current_pose.position.x
-        cary = self.current_pose.position.y
+    def accelerate( self, waypoints, near_i ):
+        for wp in waypoints:
+            wp.twist.twist.linear.x = self.vel_max
 
-        rospy.loginfo("Finding closest waypoint to car at position %f, %f", carx, cary)
-        # find the closest waypoint to the car
-        min_dist = sys.maxsize
-        min_loc = None
-        for i, waypoint in enumerate(self.waypoints):
-            wp_x = waypoint.pose.pose.position.x
-            wp_y = waypoint.pose.pose.position.y
-            # distance calulated with distance formula... sqrt((x1 - x2)^2 + (y1 - y2)^2)
-            dist = math.sqrt((carx - wp_x)**2 + (cary - wp_y)**2)
-            
-            # This isn't entirely right.. need to make sure the waypoint is in front of the 
-            # car as well as being the nearest
-            if dist < min_dist:
-                min_dist = dist
-                min_loc = i
+    def decelerate( self, waypoints, near_i ):
+        MAX_DECEL = 0.5
+        MAX_ACCEL = 1.0
 
-        closest_wp_pos = self.waypoints[min_loc].pose.pose.position
-        
-        rospy.loginfo("Closeset waypoint- idx:%d x:%f y:%f", min_loc, closest_wp_pos.x, closest_wp_pos.y);
-        
-        # Now that we have the shortest distance, get the next LOOKAHEAD_WPS waypoints.
-        # This next line ensures that we loop around to the start of the list if we've hit the end.
-        # Not sure this is 100% correct... there's a pretty large delta between the positions 
-        # at the end and beginning of the list 
-        next_wps = list(islice(cycle(self.waypoints), min_loc, min_loc + LOOKAHEAD_WPS))
+        last = waypoints[-1]
+        last.twist.twist.linear.x = 0.
 
-        rospy.loginfo("Publishing next waypoints to final_waypoints")
-        lane = Lane()
-        lane.waypoints = next_wps
-        lane.header.frame_id = '/world'
-        lane.header.stamp = rospy.Time(0)
-        self.final_waypoints_pub.publish(lane)
+        num = len( waypoints )
+
+        if num > 1:
+            d0 = self.distance( self.base_wps.waypoints, near_i, near_i + 1 )
+            meet = False
+            for i in range( num - 1 ):
+                dist = self.distance( waypoints, i, num - 1 )
+                vel = math.sqrt(2 * MAX_DECEL * dist)
+                if vel < 1.:
+                    vel = 0.
+                vel = min( vel, self.vel_max )
+
+                waypoints[ i ].twist.twist.linear.x = vel
+
+                # if not meet:
+                #     dist2 = self.distance( waypoints, 0, i ) + d0
+                #     vel2 = math.sqrt( self.velocity ** 2 + 2 * MAX_ACCEL * dist2 )
+                #     vel2 = min( vel2, self.vel_max )
+
+                #     meet = vel2 >= vel
+                #     waypoints[ i ].twist.twist.linear.x = min( vel, vel2 )
+                # else:
+                #     waypoints[ i ].twist.twist.linear.x = vel
+
+        return waypoints
+
 
 if __name__ == '__main__':
     try:
